@@ -1,0 +1,43 @@
+
+WEC-Sim Input From Standard wecSimInputFile.m Of Case Directory... 
+WEC-Sim: An open-source code for simulating wave energy converters
+Version: 6.0
+
+Initializing the Simulation Class...
+	Case Dir: D:\MOST\MOST\Examples\VolturnUS 
+历时 22.946656 秒。
+
+WEC-Sim Pre-processing ...   
+历时 3.579943 秒。
+
+WEC-Sim Simulation Settings:
+	Start Time                     (sec) = 0
+	End Time                       (sec) = 1000
+	Time Step Size                 (sec) = 0.01
+	Ramp Function Time             (sec) = 20
+	Convolution Integral Interval  (sec) = 60
+	 Number of Time Steps     = 100000 
+
+Wave Environment: 
+	Wave Type                            = Irregular Waves (Predefined Random Phase)
+	Spectrum Type                        = JONSWAP 
+	Significant Wave Height, Hs      (m) = 4
+	Peak Wave Period, Tp           (sec) = 8
+
+List of Body: Number of Bodies = 1 
+
+	***** Body Number 1, Name: VolturnUS_Nemoh *****
+	Body CG                          (m) = [0,0,-15.1025]
+	Body Mass                       (kg) = 1.76777E+07 
+	Body Moments of Inertia       (kgm2) = [1.19864E+10,1.19864E+10,2.2345E+10]
+	Body Products of Inertia      (kgm2) = [-3E-06,0,0]
+
+List of PTO(s): No PTO in the system
+
+List of Constraint(s): Number of Constraints = 1 
+
+	***** Constraint Name: Constraint1 *****
+
+
+Simulating the WEC device defined in the SimMechanics model D:\MOST\MOST\Examples\VolturnUS\SModel_VolturnUS.slx...   
+历时 0.620353 秒。
