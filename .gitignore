@@ -1,0 +1,6 @@
+# 忽略数据/日志/编辑产物
+mostData/
+*.mat
+*.log
+build/
+
