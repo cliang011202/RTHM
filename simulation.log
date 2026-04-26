@@ -4,11 +4,11 @@ WEC-Sim: An open-source code for simulating wave energy converters
 Version: 6.0
 
 Initializing the Simulation Class...
-	Case Dir: D:\MOST\MOST\Examples\VolturnUS 
-历时 22.946656 秒。
+	Case Dir: D:\MOST\MOST\Examples\RTHM 
+历时 14.928982 秒。
 
 WEC-Sim Pre-processing ...   
-历时 3.579943 秒。
+历时 2.459288 秒。
 
 WEC-Sim Simulation Settings:
 	Start Time                     (sec) = 0
@@ -39,5 +39,9 @@ List of Constraint(s): Number of Constraints = 1
 	***** Constraint Name: Constraint1 *****
 
 
-Simulating the WEC device defined in the SimMechanics model D:\MOST\MOST\Examples\VolturnUS\SModel_VolturnUS.slx...   
-历时 0.620353 秒。
+Simulating the WEC device defined in the SimMechanics model D:\MOST\MOST\Examples\RTHM\SModel_VolturnUS.slx...   
+历时 11.281998 秒。
+历时 509.560909 秒。
+
+Post-processing and saving...   
+历时 7.790613 秒。

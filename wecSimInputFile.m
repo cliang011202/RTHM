@@ -53,7 +53,7 @@ windSpeed0=8;
 load(fullfile('mostData','windTurbine','control','SteadyStates_IEA15MW.mat'))
 
 windTurbine(1) = windTurbineClass('IEA15MW');                                                                       % Initialize turbine size and Specify Type
-windTurbine(1).aeroLoadsType = 1;                                                                                   % AeroLoads type: 0-->LUT, 1-->BEM
+windTurbine(1).aeroLoadsType = 0;                                                                                   % AeroLoads type: 0-->LUT, 1-->BEM
 windTurbine(1).control = 0;                                                                                         % Controltype: 0-->Baseline, 1-->ROSCO 
 windTurbine(1).omega0 = interp1(SteadyStates.ROSCO.SS.WINDSPEED,SteadyStates.ROSCO.SS.ROTSPD,windSpeed0);           % Initial value for rotor speed
 windTurbine(1).bladepitch0 = interp1(SteadyStates.ROSCO.SS.WINDSPEED,SteadyStates.ROSCO.SS.BLADEPITCH,windSpeed0);  % Initial value for bladepitch
