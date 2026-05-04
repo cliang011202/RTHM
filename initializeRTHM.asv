@@ -25,18 +25,17 @@ simu.setup();
 
 %% --- 2. wind ---
 wind = windClass();
-
 % 2.1非定常风场文件
-wind.ConstantWindFlag = 0;
-wind.WindDataFile = fullfile('mostData','turbSim','WIND_8mps.mat');
-assert(isfile(wind.WindDataFile),'TurbSim 风场文件不存在: %s', wind.WindDataFile);
+% wind.ConstantWindFlag = 0;
+% wind.WindDataFile = fullfile('mostData','turbSim','WIND_8mps.mat');
+% assert(isfile(wind.WindDataFile), ...
+%     'TurbSim 风场文件不存在: %s', wind.WindDataFile);
 % 2.2定长风
-% wind.ConstantWindFlag    = 1;
-% wind.V_time_breakpoints  = [0  simu.endTime];
-% wind.V_modules           = [8  8];                  % 8 m/s 全程恒定
-% wind.V_directions        = [1 0 0; 1 0 0];          % +X
-% wind.V_dt                = 0.1;
-
+wind.ConstantWindFlag    = 1;
+wind.V_time_breakpoints  = [0  simu.endTime];
+wind.V_modules           = [8  8];                  % 8 m/s 全程恒定
+wind.V_directions        = [1 0 0; 1 0 0];          % +X
+wind.V_dt                = 0.1;
 wind.ComputeWindInput();
 
 %% --- 3. windTurbine ---
@@ -219,15 +218,3 @@ for k = 1:6
     ylabel(sprintf('%s [%s]', labels{k}, units{k}));
     if k>=5, xlabel('t [s]'); end
 end
-
-%% --- 8. 保存为 level1_<case>.mat（供 analyzeLevel1.m 使用）---
-% 跑前确认 isCase 是 'A0' / 'A1' / 'A2'，且 Simulink 里 Sine Wave 配置匹配
-saveFile = sprintf('level1_%s.mat', isCase);
-save(saveFile, 't', 'ttLoad', 'F_aero', 'data', 'c', ...
-               'windV', 'rotSpd');
-% simu 是 handle 类，存进去会带一堆引用，单独存它的几个标量字段
-simuMeta = struct('rampTime', simu.rampTime, ...
-                  'endTime',  simu.endTime,  ...
-                  'dt',       simu.dt);
-save(saveFile, 'simuMeta', '-append');
-fprintf('\n已保存到 %s\n', saveFile);

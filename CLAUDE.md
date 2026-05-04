@@ -9,7 +9,7 @@
 
 ## 目录现状
 
-**Level 1 假信号测试已能编译通过并完成仿真**（无报错）。下一步是分析 `F_aero` 输出是否合理。
+**Level 1 假信号测试可运行，三个物理合理性 case 已跑过**（A0 静止+常风、A1 surge sine、A2 pitch sine）。结果暴露了"F_aero 输出语义"和"判据信号选择"两个原本写错的认知，详见下方"Level 1 三 case 验证结果"小节。
 
 | 文件 | 状态 | 说明 |
 |---|---|---|
@@ -59,17 +59,34 @@ WEC-Sim 自带的 `Global Reference Frame` 子系统**不能直接复用**——
 |---|---|---|
 | `TowerBaseLoad` | `fc`, `tc` | 塔基处的 6-DOF 反力 / 反力矩 |
 | `TowerTopLoad and deltaYaw` | `ft`, `tt` | **塔顶处**的 6-DOF 反力 / 反力矩（含塔的惯性、重力、陀螺反力） |
-| `Aerodynamics + Control` | `F_aero` | 轮毂中心**纯气动载荷** |
+| `Aerodynamics + Control` | `F_aero` | **per-blade**、**叶片根坐标系**下的 6-DOF 气动载荷（不是 hub 总气动） |
 
-`Outputs` 子系统（紫色边框）已经把上述部分信号打包，外部用 `To Workspace` 接出来即可。
+`Outputs` 子系统（紫色边框）通过一个 17 端口 Mux 把 14 路信号合并成一个 [Nt × 49] 的矩阵输出到 `windTurbine1_out` 变量，无 label。**列序在 `initializeRTHM.m` section 6 的注释里有完整对照表**，必须按该映射取列。
 
-### **ft/tt 与 F_aero 的区别——RTHM 实现的核心区分**
+### **F_aero 与 TowerTopLoad 的关系——RTHM 实现的核心区分**
 
-- **`F_aero`**：轮毂中心的纯气动 6-DOF 载荷 [F_rx, F_ry, F_rz, M_rx, M_ry, M_rz]。**这才是 RTHM 7 桨执行器要复现的目标量**（对应 Han et al. 2025 Eq.1）。
-- **`ft / tt`**：塔顶 6 轴力传感器测到的载荷，包含塔/机舱/轮毂的惯性 + 重力 + 陀螺反力。
-- 两者通过测量补偿联系（Han et al. 2025 Eq.2–5）：实物试验中力传感器读到 ft/tt，要扣除塔顶结构的惯性力和重力，才能反推出 F_aero。
+> ⚠️ 之前误以为 "MOST 的 F_aero 是轮毂中心总气动 6-DOF 载荷"——**错的**。源码 `Aerodynamics + Control / Goto_F_aero` 的 propagated signal 是 `F_aero_r_bl`（rotor frame, by blade），即**每个叶片在自己根部坐标系下**的 6-DOF 气动载荷。三个叶片的 6-DOF 简单相加在物理上**没有意义**（坐标系不重合），数量级也明显不对（A0 静止 8 m/s 常风下，sum 出来的 M_y ≈ 1.1×10⁸ N·m，应该 ≈ 0）。
 
-**所以从 MATLAB 经 UDP 发给 STM32 的应是 `F_aero` 缩放后的 6 维向量，不是 ft/tt。**
+正确理解：
+
+- **`F_aero[i]`（i=1..3）**：第 i 片叶片根部 6-DOF 气动载荷。每个叶片单独看是合理的（典型 IEA15MW @ 8 m/s flap 弯矩约 35–45 MN·m），但三个叶片的根部坐标系互成 120°，向量直接相加是错的。MOST 没有暴露 hub-frame 的总气动信号。
+- **`ft / tt`（TowerTopLoad，cols 17:22）**：塔顶 6-DOF 反力，**包含**气动载荷传到塔顶的部分 + 塔上部结构（机舱+轮毂+叶片）的惯性 + 重力 + 陀螺反力。
+- 两者通过测量补偿联系（Han et al. 2025 Eq.2–5）：实物试验中 6 轴力传感器读到 ft/tt，扣除上部结构的惯性力 + 重力（在塔顶坐标系下随平台姿态而变）才能反推出近似的 hub 气动。
+
+**RTHM 的 UDP 输出策略**：发给 STM32 的应该是 **`TowerTopLoad - 上部结构惯性补偿 - 重力补偿`** 在 hub-fixed 坐标系下重投影后的 6-DOF 向量，**不是** sum of per-blade `F_aero`，也不是 raw `TowerTopLoad`。补偿系数（上部结构总质量、CG 位置、惯量张量）从 `windTurbine.tower / nacelle / hub / blade` 属性算。
+
+### TowerTopLoad 的静态量级（A0 8 m/s 常风、平台静止）
+
+| 分量 | 实测均值 | 主导项 | 物理解释 |
+|---|---|---|---|
+| ttFx | +1.44 MN | 气动推力 | F_thrust ≈ 0.5 ρ A V² Cₜ |
+| ttFy | +600 N | ≈ 0 | 无侧向气动 |
+| ttFz | -18.8 MN | 上部结构重力 m·g | RNA + 部分塔身 ~1900 t |
+| ttMx | +11.4 MN·m | 气动转矩 | 与 LUT 给出的 Mₐₑᵣₒ 一致 |
+| ttMy | -127.5 MN·m | **重力 × CG 偏移**主导，非气动 | m·g × overhang(~6.7 m) |
+| ttMz | -1.2 MN·m | 偏航气动+少量重力分量 | |
+
+**关键提醒**：`ttMy` 在静态下被重力偏置主导，不是气动响应。要看气动 pitching moment，**必须做 (case − A0) 减法或者解析扣除 m·g·sin(qy)·d 项**。
 
 ---
 
@@ -143,13 +160,28 @@ Wind turbine 子系统内部的 `Yaw Joint` 也是 motion-driven primitive——
 | `计算 ... Rigid Transform ... TranslationCartesianOffset ... 索引超出数组范围` | 用了 Global Reference Frame，其内部 mask 引用 `waves(1)` / `body(1)` | 不要用 Global Reference Frame；改成三块独立底座 |
 | `fewer joint primitive degrees of freedom with automatically computed force or torque (1) than with motion from inputs (7)` | Bushing Joint 的 6 个 primitive Force/Torque 都是 None | 全部改为 `Automatically Computed` |
 
-## 下一步调试顺序（模型已可运行，从这里继续）
+## Level 1 三 case 验证结果（已完成）
 
-1. 进 `Wind turbine / Outputs` 子系统，确认 `F_aero` 是否已打包到外层；外层用 `To Workspace` 或 `Scope` 把它接出来
-2. 跑 5–10 个 surge 周期（按 `Sine Wave: 5 m / 0.08 Hz`），画 `F_rx(t)`、`M_ry(t)`，**物理合理性自检**：
-   - surge 正向（平台前进追风）→ 相对风速降低 → `F_rx` 应减小
-   - pitch 正向（机舱后倾）→ 风速分量在 hub 法向投影变化 → `M_ry` 应反向
-   - 6 路全 0 时（去掉 Sine Wave）→ 应得到稳态推力 ≈ NREL 5MW / IEA 15MW 在 8 m/s 的额定值
-3. 用 `tic/toc` 包住 `sim(...)` 调用，估算 LUT 单步耗时（项目根 CLAUDE.md TODO Phase 3 要求 < 10 ms）
-4. PS Converter 的二阶导滤波时间常数做敏感性扫描（0.001 / 0.01 / 0.1 s），观察对 `F_aero` 的影响——太大会污染信号，太小会引入数值高频
-5. 通过后进入 `MOST开发.md` 的第 2 级（回放 VolturnUS 全数值结果做参考真值对比）和第 3 级（UDP loopback）
+跑过 3 个 case 都用常风 8 m/s + IEA15MW + LUT 模式，sim 时长 60 s，rampTime = 5 s。判据信号统一用 `TowerTopLoad`（cols 17:22）。
+
+| Case | 平台位姿 | 关键判据 | 实测 | 结论 |
+|---|---|---|---|---|
+| **A0** 静止+常风 | 6 路全 0 | ttFx ≈ 1 MN，ttMy ≈ 0 | ttFx = +1.44 MN ✓<br>**ttMy = -127 MN·m**（重力偏置） | ttMy 静态被重力主导，**不能直接当气动判据** |
+| **A1** surge sine | px = 5 sin(2π·0.08·t)，余 0 | corr(v_surge, ttFx) < 0 强相关 | corr = **−0.17** | 方向对、相关性弱（结构惯性反力部分抵消气动响应） |
+| **A2** pitch sine | qy = 3°·sin(2π·0.05·t)，余 0 | corr(qy, ttMy) < 0 | corr = **+0.08** | **看不出气动响应**——pitch 让塔顶坐标系旋转，重力投影变化（~MN·m 级）盖过气动小扰动 |
+
+**根因和教训**：
+
+1. **F_aero 列 sum 不等于 hub 气动**——上一节已修正。
+2. **A0 的 ttFx ≈ 1.44 MN 比理论估算（~1 MN）偏大约 40%**：可能 LUT 的 Cₜ 在 8 m/s 偏保守，或 IEA15MW LUT 在该工况标定与 OpenFAST 略偏；不影响功能性结论。
+3. **A2 失败的真正原因不是模型错**——TowerTopLoad 表达在 *塔顶坐标系*，平台 pitch 时坐标系自己旋转，`m·g·sin(qy)` 投影变化（~1 MN·m 级）远大于气动 pitching moment 扰动（~kN·m 级）。
+4. **Level 1 物理合理性判据要做** `(case − A0)` **基线相减**，或者把 ttLoad 先转回 *塔顶 inertial 坐标系*（手算 ⊕ 反向 R(qx,qy,qz)）再做气动判据。
+
+## 下一步调试顺序
+
+1. **重做 A1/A2 判据**：把 `ttLoad − ttLoad_A0_mean` 当作"动态响应"，再算相关性。预期 A1 corr → 强负、A2 corr → 强负。
+2. **开始 hub-frame 气动重建**：写一个工具函数 `hubAeroFromTT(ttLoad, motion, params)`，输入 ttLoad + 平台 6-DOF 位姿/速度/加速度 + 上部结构质量/惯量参数，输出 hub-fixed 坐标系下的近似气动 6-DOF。这是 Han et al. 2025 Eq.2–5 的实现，也是 RTHM 通过 UDP 发出去的目标量的来源。
+3. **基线 LUT 单步耗时 benchmark**：用 `tic/toc` 包 `sim(...)`，3 次取均值，除以步数。CLAUDE.md TODO Phase 3 要求 < 10 ms/step。
+4. **PS Converter 滤波时间常数敏感性扫描**：0.001 / 0.01 / 0.1 s，看对 ttLoad 的影响。
+5. **进入 Level 2**：跑原版 `SModel_VolturnUS.slx` 全数值，存 `body(1)` 6-DOF 时序，回放给 RTHM 模型，逐点对比 ttLoad / hub-aero。
+6. **进入 Level 3**：UDP loopback（详见 `MOST开发.md`）。
