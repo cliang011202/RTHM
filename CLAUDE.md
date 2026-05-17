@@ -16,11 +16,13 @@ Level 1 假信号物理判据由于 LUT 模式 + 常风下 V_at_hub 与平台运
 | 文件 | 状态 | 说明 |
 |---|---|---|
 | `wecSimInputFile.m` | 复制自 VolturnUS，**未使用** | 干净路 B 不再调用它；保留作历史参考 |
-| `SModel_RTHM.slx` | **可运行** | 顶层只剩 World Frame + Mechanism Configuration + Solver Configuration + Bushing Joint + `Wind turbine` 子系统 + 6 路位姿输入 |
+| `SModel_RTHM.slx` | **可运行** | 顶层：World Frame + Mechanism Configuration + Solver Configuration + Bushing Joint + `Wind turbine` 子系统 + 6 路位姿输入 (From Workspace × 3 → Demux × 3 → PS Converter × 6) **+ UDP 输出链路 (From → Rate Transition → Counter → MATLAB System → UDP Send)** |
 | `SModel_VolturnUS.slx` | 备份 | 原始 VolturnUS Simulink 模型副本，不要动 |
 | `initializeRTHM.m` | **干净路 B 已落地，可运行** | 不再 `run('wecSimInputFile')`；脚本里直接定义 simu / wind / windTurbine 三个对象。详见下方"initializeRTHM.m 实际结构" |
+| `initializeRTHM_replay.m` | **可运行** | Level 2 回放脚本；含 UDP 发包 |
+| `UDPPacketPacker.m` | **新增** | MATLAB System 类：将 TowerTopLoad [6×1] + seq → 28 字节 UDP 数据报 |
 | `MOST开发.md` | 用户笔记 | 记录"假信号 → 全数值回放 → UDP loopback"三级测试方案 |
-| `STM32/` | 用户新增 | UDP 测试模型 + 测试脚本 |
+| `STM32/` | 用户新增 | UDP 测试模型 + `send_test_packet.m` |
 
 ---
 
@@ -236,9 +238,72 @@ PS Converter 必须设：
 | Mz | 0.85 MN·m | -0.46 MN·m | (small mean) | — |
 | **per-blade Faero** | — | — | — | **~12%（azimuth 相位漂移，可接受）** |
 
+## UDP 输出链路（已实现）
+
+**SModel_RTHM.slx 顶层新增 7 个块**，从 `TowerTopLoad` 和 `NacAcc` Goto 标签读取信号，经 Han et al. (2025) Eq.2-5 补偿后，降采样到 25 Hz 通过 UDP 发给 STM32：
+
+```
+UDP_TowerTopLoad_From ──► UDP_RateTransition ──┐
+  (TowerTopLoad1, [6×1])   (0.01→0.04s, 25Hz)  │
+                                                 ├──► UDP_PackBytes ──► UDP_Send
+UDP_NacAcc_From ────────► UDP_NacAcc_RT ────────┤    (MATLAB System)   (192.168.1.100:8080)
+  (NacAcc1, [3×1])         (0.01→0.04s)         │    3 inputs:          ↑
+                                                 │    [6] + [1] + [3]   │
+                             UDP_SeqCounter ─────┘                      │
+                             (Counter Limited, tsamp=0.04)              │
+```
+
+**Han et al. (2025) Eq.2–5 补偿** (在 `UDPPacketPacker.stepImpl` 中实现):
+```
+F_aero = F_ttLoad - m_RNA·a_nac - m_RNA·g
+M_aero = M_ttLoad - r_cg × (m_RNA·a_nac) - r_cg × (m_RNA·g)
+```
+其中 m_RNA = 921,778 kg, r_cg = [-6.90, 0, 10.83] m (相对塔顶).
+
+| 块 | 类型 | 关键参数 |
+|---|---|---|
+| `UDP_TowerTopLoad_From` | From | GotoTag=`"TowerTopLoad1"` (global, 来自 Wind turbine 子系统) |
+| `UDP_RateTransition` | Rate Transition | OutPortSampleTime=`"0.04"` (100→25 Hz) |
+| `UDP_NacAcc_From` | From | GotoTag=`"NacAcc1"` (global, nacelle 3-axis acceleration) |
+| `UDP_NacAcc_RateTransition` | Rate Transition | OutPortSampleTime=`"0.04"` |
+| `UDP_SeqCounter` | Counter Limited | tsamp=`0.04`, uplimit=`4294967295` |
+| `UDP_PackBytes` | MATLAB System | System=`UDPPacketPacker`, 输入 [6×1]+[1×1]+[3×1], 输出 [28×1 uint8] |
+| `UDP_Send` | MATLAB System | Host=`192.168.1.100`, Port=`8080`, LocalPort=`12345`, Blocking=`off` |
+
+**数据包格式**（与 `send_test_packet.m` 完全一致）：
+- 1–4 字节: uint32 LE 序号
+- 5–28 字节: 6 × single LE (Fx, Fy, Fz, Mx, My, Mz)
+- 总计 28 字节
+
+
+**UDPPacketPacker** (`UDPPacketPacker.m`): MATLAB System 类。`stepImpl` 接收 3 路输入 → 调用 `compensate()` 做 Han Eq.2–5 补偿 → `packBytes()` 打包为 28 字节 uint8。RNA 质量和 CG 作为类属性，可通过 `set_param` 或直接改类文件调整。补偿可通过 `EnableCompensation` 属性开关。
+
+**已验证** (2026-05-17): `initializeRTHM_replay.m` 跑 120s 仿真，25 Hz × 120s = ~3000 包正常发出，120s 原型仿真用时 111s。
+
+**注意事项**:
+- 发送的是 **补偿后的等效 hub 气动 6-DOF**（已扣除 RNA 重力 + 惯性力）
+- 补偿精度：A0 静态测试 Fz 从 -9.40 MN → -0.36 MN（削减 96%），My 从 -56.9 MN·m → -2.68 MN·m（削减 95%）
+- 残余误差主要来自 (1) RNA 质量/ CG 参数精度 (2) 重力在塔顶坐标系投影的近似（当前假设塔近垂直）
+- 如果 STM32 没接或没监听 8080 端口，UDP 包会被静默丢弃（UDP 无连接）
+- 模型更新 (Ctrl+D) 需要 base workspace 中定义 simu/wind/windTurbine 等变量，否则 Wind turbine 子系统 mask 报错
+
+### 踩坑: MATLAB Function vs MATLAB System
+
+最初尝试用 `simulink/User-Defined Functions/MATLAB Function` 做字节打包，但 R2025b 的 Stateflow API 变化导致无法通过 `sf()` 或 `sfroot` 程序化设置 EML Chart 的 Script。换成 `simulink/User-Defined Functions/MATLAB System` + 独立类文件 `UDPPacketPacker.m` 解决了问题。注意 `matlab.System` 子类必须实现 `isOutputComplexImpl` 和 `isInputComplexImpl` 方法（R2025b 会检查），否则编译报错。
+
+### 初始化脚本更新
+
+`initializeRTHM.m` 和 `initializeRTHM_replay.m` 开头都加了:
+```matlab
+addpath(fileparts(mfilename('fullpath')));
+```
+确保 `UDPPacketPacker` 类在路径上。
+
+---
+
 ## 下一步
 
-1. **hub-frame 气动重建**：实现 Han et al. 2025 Eq.2–5。从 ttLoad（cols 17:22）减去上部结构 m·a 惯性补偿，反推出 hub-fixed 坐标系下的近似气动 6-DOF。这是 RTHM 通过 UDP 发到 STM32 的目标量。需要的参数：上部结构总质量、CG 位置、惯量张量——可以从 windTurbine.tower / nacelle / hub / blade 属性拼出来。
+1. **hub-frame 气动重建** ✅ **已实现** (2026-05-17): Han et al. 2025 Eq.2–5 补偿已在 `UDPPacketPacker.compensate()` 中落地。A0 静态验证：Fz 削减 96%, My 削减 95%。待完善：(a) 用平台姿态实时旋转重力向量（当前假设塔近垂直），(b) 加入转动惯性补偿 (I·α + ω×I·ω 项)，(c) 添加 NacAcc angular velocity/acceleration 输入。
 2. **LUT 单步耗时 benchmark**：用 `tic/toc` 包 `sim(...)` 3 次取均值除以步数。项目根 CLAUDE.md TODO Phase 3 要求 < 10 ms/step。
-3. **Level 3：UDP loopback**：建 `MockMocap.slx`，把 `level2_volturnUS_ref.mat` 的 body 6-DOF 用 UDP 100 Hz 发回 SModel_RTHM.slx 的 UDP 接收块（替换 From Workspace），验证字节序、float32/64、丢包注入、watchdog。
+3. **Level 3：UDP loopback**：建 `MockMocap.slx`，把 `level2_volturnUS_ref.mat` 的 body 6-DOF 用 UDP 100 Hz 发回 SModel_RTHM.slx 的 UDP Receive 块（替换 From Workspace），验证字节序、float32/64、丢包注入、watchdog。同时做 MATLAB → STM32 的实机收发验证（Wireshark 抓包 + STM32 解析 28 字节包）。
 4. **Level 3 之后**：把 STM32 那一头接进来，整条 mocap → MATLAB → MOST → 缩放 → 7 桨分配 → STM32 通路在水池外打通。
