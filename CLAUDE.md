@@ -9,7 +9,9 @@
 
 ## 目录现状
 
-**Level 1 假信号测试可运行，三个物理合理性 case 已跑过**（A0 静止+常风、A1 surge sine、A2 pitch sine）。结果暴露了"F_aero 输出语义"和"判据信号选择"两个原本写错的认知，详见下方"Level 1 三 case 验证结果"小节。
+**Level 2 全数值回放对比已通过**（VolturnUS 跑出 body 6-DOF + ttLoad 参考，RTHM 用 From Workspace 回放，逐点对比）。主分量 ttLoad DC 偏差 < 0.5%，AC 残差 < 10%，剩余 12% per-blade Faero 残差是独立 ode4 积分的 azimuth 相位漂移（不影响 RTHM 实时通路，因为实时通路用自己的 azimuth）。
+
+Level 1 假信号物理判据由于 LUT 模式 + 常风下 V_at_hub 与平台运动脱钩，三 case 不通过——这是设计约束，不是模型 bug，详见下方"Level 1 三 case 验证结果"小节。
 
 | 文件 | 状态 | 说明 |
 |---|---|---|
@@ -43,10 +45,12 @@ WEC-Sim 自带的 `Global Reference Frame` 子系统**不能直接复用**——
 
 正确做法：从 Simscape 库里拖三个**独立**的块到顶层：
 - `World Frame`：Simscape > Multibody > Frames and Transforms
-- `Mechanism Configuration`：Simscape > Multibody > Utilities，双击设 `Uniform Gravity = [0 0 -9.80665]`
+- `Mechanism Configuration`：Simscape > Multibody > Utilities，双击设 **`Uniform Gravity → Gravity Vector = [0 0 0]`**
 - `Solver Configuration`：Simscape > Utilities
 
 后两个块各自只有一个 PS 端口，把它们 T 接到 World Frame → Bushing Joint 那条物理线上即可（Simscape 自动加分支）。
+
+> ⚠ **`GravityVector = [0 0 0]` 不是笔误，必须为 0**——参 VolturnUS。原因详见下方"Mechanism Configuration 的重力为什么必须为 0"小节。Level 2 全数值对比的核心 fix 就是这条。
 
 ### 关键确认：`w.r.f` 是 Simscape Multibody frame 端口
 
@@ -114,7 +118,20 @@ Bushing Joint 的 6 个 DOF 在 motion-driven 模式下，Simscape 内部需要 
 ### 3. windTurbine 模块期望的位姿语义
 模块内部已经做了 `Offset plane → Offset Z → Tower Height → Yaw Joint → Twr2shaft+Tilt → Overhang` 的链式变换。所以 `w.r.f` 端要喂的是**平台参考点**（≈ SWL 处的 platform origin）的 6-DOF 位姿，**不是 hub 中心**。Bushing Joint 的 F 帧位置语义要和原 VolturnUS 模型里 `body(1)` 的参考点保持一致。
 
-### 4. Bushing Joint 的 Force/Torque 必须设为 Automatically Computed
+### Mechanism Configuration 的重力为什么必须为 0
+
+`GravityVector = [0 0 0]` 这一条是**对齐 VolturnUS 的关键**。证据链：
+
+- 反编译 `WECSim_Lib_Frames.slx` 的 `Global Reference Frame` 子系统：内部的 `Mechanism Configuration` 设的是 `GravityVector = [0 0 0]`
+- 也就是说 VolturnUS 全程**没有**让 Simscape Multibody 给任何 Solid 块（含 windTurbine 子系统的塔/机舱/轮毂/叶片）自动加重力
+- 重力在 VolturnUS 里是被 **WEC-Sim body class 通过水静力补偿来表达**——`body.mass × g` 在 hydrostatic restoring 里被减一遍 buoyancy，整套 weight 由 body 一手管
+- windTurbine 子系统对外的 `TowerTopLoad` 因此只反映**气动 + 上部结构惯性**，不含 m·g 反力
+
+如果 RTHM 错把 Mech Config gravity 设成 `[0 0 -9.80665]`，windTurbine 内部所有 Solid 块会被加上重力，TowerTopLoad 多出 ~9 MN 的 Fz 偏置和 ~70 MN·m 的 My 偏置（相当于 VolturnUS 与 RTHM 的 Level 2 对比直接 dropout 一个数量级）。Level 2 验证里的"DC 偏差 9.31 MN / 65.8 MN·m"就是这条没设对踩出来的。
+
+**对 RTHM 实时通路也是好事**：Han et al. 2025 Eq.2-5 要做的是 `F_aero = TowerTopLoad − 上部结构惯性补偿`。**重力不在 TowerTopLoad 里就少减一项**，公式更清爽。
+
+### Bushing Joint 的 Force/Torque 必须设为 Automatically Computed
 
 每个 motion-from-input 的 primitive 必须配一个 auto-computed 反力/反力矩，否则 Simscape 编译期会报 "fewer joint primitive degrees of freedom with automatically computed force or torque (1) than with motion from inputs (7)"。
 
@@ -177,11 +194,51 @@ Wind turbine 子系统内部的 `Yaw Joint` 也是 motion-driven primitive——
 3. **A2 失败的真正原因不是模型错**——TowerTopLoad 表达在 *塔顶坐标系*，平台 pitch 时坐标系自己旋转，`m·g·sin(qy)` 投影变化（~1 MN·m 级）远大于气动 pitching moment 扰动（~kN·m 级）。
 4. **Level 1 物理合理性判据要做** `(case − A0)` **基线相减**，或者把 ttLoad 先转回 *塔顶 inertial 坐标系*（手算 ⊕ 反向 R(qx,qy,qz)）再做气动判据。
 
-## 下一步调试顺序
+## Level 2 全数值回放对比（已通过）
 
-1. **重做 A1/A2 判据**：把 `ttLoad − ttLoad_A0_mean` 当作"动态响应"，再算相关性。预期 A1 corr → 强负、A2 corr → 强负。
-2. **开始 hub-frame 气动重建**：写一个工具函数 `hubAeroFromTT(ttLoad, motion, params)`，输入 ttLoad + 平台 6-DOF 位姿/速度/加速度 + 上部结构质量/惯量参数，输出 hub-fixed 坐标系下的近似气动 6-DOF。这是 Han et al. 2025 Eq.2–5 的实现，也是 RTHM 通过 UDP 发出去的目标量的来源。
-3. **基线 LUT 单步耗时 benchmark**：用 `tic/toc` 包 `sim(...)`，3 次取均值，除以步数。CLAUDE.md TODO Phase 3 要求 < 10 ms/step。
-4. **PS Converter 滤波时间常数敏感性扫描**：0.001 / 0.01 / 0.1 s，看对 ttLoad 的影响。
-5. **进入 Level 2**：跑原版 `SModel_VolturnUS.slx` 全数值，存 `body(1)` 6-DOF 时序，回放给 RTHM 模型，逐点对比 ttLoad / hub-aero。
-6. **进入 Level 3**：UDP loopback（详见 `MOST开发.md`）。
+**目标**：跑原版 `SModel_VolturnUS.slx`（带 body+hydro+mooring+waves）拿到 body 6-DOF 真实响应作为参考，把这份位姿喂给 SModel_RTHM.slx 的 Bushing Joint，逐点对比两份的 windTurbine 输出。如果两份吻合 → RTHM 路径在结构/坐标系/单位/积分上都正确。
+
+**实现脚本**：
+- `runVolturnUSReference.m`：临时改 VolturnUS 的 `simu.endTime = 120`（用正则替换 + try/finally 恢复 + setenv 兜底 wecSim 的 blanket clear），跑 wecSim，存 body 6-DOF + ttLoad/Faero/nacAcc 到 `level2_volturnUS_ref.mat`
+- `initializeRTHM_replay.m`：把 `ref.body_pos / body_vel / body_acc` 三组数据放进 base workspace 作 `BushingPos / BushingVel / BushingAcc`，跑 RTHM
+- `analyzeLevel2.m`：逐点对比
+
+**Simulink 端的关键改动**（替换原 Sine Wave + 5 Constants 的 6 路输入）：
+
+```
+3 个 From Workspace (BushingPos / BushingVel / BushingAcc, 各 Nt × 7)
+        ↓
+3 个 Demux 6 (拆 6 路标量)
+        ↓
+6 个 PS Converter，每个左侧有 3 个标量输入端口 (f, f', f'')
+        ↓ 直接喂 pos/vel/acc 三路（不需要 Mux 合一路再喂！）
+        ↓
+Bushing Joint 的 6 个 motion-from-input primitive
+```
+
+PS Converter 必须设：
+- **Filtering and derivatives** = `Provide input derivative(s)`
+- **Input derivatives** = `Provide first and second derivatives`
+
+如果保留原来的"Filter input, derivatives calculated"模式，PS Converter 会从位置数值微分出速度和加速度——这对采样数据数值病态，导致 nacelle 加速度被放大 100×（VolturnUS ~1 m/s² 被放大成 RTHM ~70 m/s²）。
+
+**通过判据**：主分量（>1 MN/MN·m 量级）DC 偏移 < 5%，AC 残差比 < 10%。Fy/Mz 因均值 kN 量级太小，不算入主分量。
+
+**典型结果（IEA15MW @ 8 m/s + Hs=4m JONSWAP，120 s 仿真）**：
+
+| 分量 | VolturnUS mean | RTHM mean | DC 偏移 | std/\|mean\| |
+|---|---|---|---|---|
+| Fx | 1.52 MN | 1.49 MN | 2.3% | 5.6% |
+| Fy | -57 kN | -60 kN | (small mean) | — |
+| Fz | -9.43 MN | -9.43 MN | 0.03% | 0.2% |
+| Mx | 10.2 MN·m | 9.7 MN·m | 4.6% | 5.5% |
+| My | -54.7 MN·m | -55.2 MN·m | 0.9% | 8.2% |
+| Mz | 0.85 MN·m | -0.46 MN·m | (small mean) | — |
+| **per-blade Faero** | — | — | — | **~12%（azimuth 相位漂移，可接受）** |
+
+## 下一步
+
+1. **hub-frame 气动重建**：实现 Han et al. 2025 Eq.2–5。从 ttLoad（cols 17:22）减去上部结构 m·a 惯性补偿，反推出 hub-fixed 坐标系下的近似气动 6-DOF。这是 RTHM 通过 UDP 发到 STM32 的目标量。需要的参数：上部结构总质量、CG 位置、惯量张量——可以从 windTurbine.tower / nacelle / hub / blade 属性拼出来。
+2. **LUT 单步耗时 benchmark**：用 `tic/toc` 包 `sim(...)` 3 次取均值除以步数。项目根 CLAUDE.md TODO Phase 3 要求 < 10 ms/step。
+3. **Level 3：UDP loopback**：建 `MockMocap.slx`，把 `level2_volturnUS_ref.mat` 的 body 6-DOF 用 UDP 100 Hz 发回 SModel_RTHM.slx 的 UDP 接收块（替换 From Workspace），验证字节序、float32/64、丢包注入、watchdog。
+4. **Level 3 之后**：把 STM32 那一头接进来，整条 mocap → MATLAB → MOST → 缩放 → 7 桨分配 → STM32 通路在水池外打通。

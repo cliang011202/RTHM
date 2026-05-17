@@ -4,6 +4,9 @@
 % 所有与水动力 / 波浪 / 系泊相关的预处理。
 clear; close all; bdclose('all');
 
+% Ensure RTHM directory is on path (for UDPPacketPacker, etc.)
+addpath(fileparts(mfilename('fullpath')));
+
 %% --- 1. simu (only what SModel_RTHM.slx needs) ---
 simu = simulationClass();
 simu.simMechanicsFile = 'SModel_RTHM.slx';

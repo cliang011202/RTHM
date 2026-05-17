@@ -11,18 +11,28 @@
 
 clear; close all; bdclose('all');
 
+% Ensure RTHM directory is on path (for UDPPacketPacker, etc.)
+addpath(fileparts(mfilename('fullpath')));
+
 %% --- 0. 加载 VolturnUS 参考数据，准备 From Workspace 输入 ---
 refFile = 'level2_volturnUS_ref.mat';
 assert(isfile(refFile), '%s 不存在；先跑 runVolturnUSReference.m', refFile);
 ref = load(refFile);
 
-% From Workspace 接受的最简格式：[time, signal_cols] 的 [Nt × 7] 矩阵
-% 6 列分别是 px py pz qx qy qz（与 Bushing Joint primitive 顺序一致）
-BushingMotion = [ref.t, ref.body_pos];
-assert(size(BushingMotion,2) == 7, 'BushingMotion 应为 Nt×7（time + 6DOF）');
+% From Workspace 接受 [time, signal_cols] 的 Nt×N 矩阵
+% 我们要喂三组：位置、速度、加速度，因为 PS Converter 用 "Provide input
+% derivative(s)" 模式而不是 filter 模式（filter 数值病态，详见 Level 2 Debug）
+BushingPos = [ref.t, ref.body_pos];     % Nt×7  [t, px py pz qx qy qz]
+BushingVel = [ref.t, ref.body_vel];     % Nt×7  [t, vpx vpy vpz vqx vqy vqz]
+BushingAcc = [ref.t, ref.body_acc];     % Nt×7  [t, apx apy apz aqx aqy aqz]
+assert(size(BushingPos,2) == 7 && size(BushingVel,2) == 7 && size(BushingAcc,2) == 7, ...
+    'Bushing 数据应均为 Nt×7（time + 6DOF）');
 
-fprintf('回放数据已准备：BushingMotion size = [%d × %d]，时间跨度 0 - %.0f s\n', ...
-        size(BushingMotion,1), size(BushingMotion,2), ref.t(end));
+fprintf('回放数据已准备：BushingPos/Vel/Acc 各 [%d × %d]，时间跨度 0 - %.0f s\n', ...
+        size(BushingPos,1), size(BushingPos,2), ref.t(end));
+
+% 兼容旧的 Simulink 写法（如果还连着 Demux→6个PS Converter的旧版模型）
+BushingMotion = BushingPos;
 
 %% --- 1. simu (与 VolturnUS 参考时长一致；其它参数与 initializeRTHM.m 相同) ---
 simu = simulationClass();
@@ -104,6 +114,7 @@ out = simOut.windTurbine1_out;
 data = out.signals(1).values;
 t    = out.time;
 
+c.NacAcc       = 7:9;
 c.TowerTopLoad = 17:22;
 c.FaeroBlade1  = 31:36;
 c.FaeroBlade2  = 37:42;
@@ -113,8 +124,10 @@ ttLoad_RTHM = data(:, c.TowerTopLoad);
 faero1_RTHM = data(:, c.FaeroBlade1);
 faero2_RTHM = data(:, c.FaeroBlade2);
 faero3_RTHM = data(:, c.FaeroBlade3);
+nacAcc_RTHM = data(:, c.NacAcc);              % [Nt × 3] 运动一致性自检
 
 %% --- 7. 保存供 analyzeLevel2.m 分析 ---
 save('level2_RTHM_replay.mat', ...
-     't', 'ttLoad_RTHM', 'faero1_RTHM', 'faero2_RTHM', 'faero3_RTHM', 'BushingMotion');
+     't', 'ttLoad_RTHM', 'faero1_RTHM', 'faero2_RTHM', 'faero3_RTHM', ...
+     'nacAcc_RTHM', 'BushingMotion');
 fprintf('\nRTHM 回放结果存到 level2_RTHM_replay.mat\n');
