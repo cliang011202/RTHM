@@ -20,7 +20,12 @@ Level 1 假信号物理判据由于 LUT 模式 + 常风下 V_at_hub 与平台运
 | `SModel_VolturnUS.slx` | 备份 | 原始 VolturnUS Simulink 模型副本，不要动 |
 | `initializeRTHM.m` | **干净路 B 已落地，可运行** | 不再 `run('wecSimInputFile')`；脚本里直接定义 simu / wind / windTurbine 三个对象。详见下方"initializeRTHM.m 实际结构" |
 | `initializeRTHM_replay.m` | **可运行** | Level 2 回放脚本；含 UDP 发包 |
-| `UDPPacketPacker.m` | **新增** | MATLAB System 类：将 TowerTopLoad [6×1] + seq → 28 字节 UDP 数据报 |
+| `UDPPacketPacker.m` | **已完善** | MATLAB System 类：6 路输入，完整 Han Eq.2-5 补偿（平移+重力旋转+转动惯性+陀螺）+ Froude 缩尺（原型→模型），打包 28 字节 UDP |
+| `benchLUT.m` | **已运行** | LUT 单步耗时 benchmark：3×30s, 平均 8.01 ms/step, ×1.2 超实时 |
+| `MocapPacketPacker.m` | **已验证** | MATLAB System 类：4 路输入 [pos(6),vel(6),acc(6),seq] → 76 字节 UDP 包 |
+| `MocapPacketUnpacker.m` | **已验证** | MATLAB System 类：76 字节 UDP 包 → [pos(6),vel(6),acc(6),seq,valid] 5 路输出 |
+| `testMocapPackUnpack.m` | **已通过** | 纯 MATLAB 打包/解包往返测试，误差 < 1e-6 |
+| `testUdpMocapLoopback.m` | **已通过** | 纯 MATLAB UDP localhost 收发测试: 12001 包, 0 丢包, 8812 pkt/s |
 | `MOST开发.md` | 用户笔记 | 记录"假信号 → 全数值回放 → UDP loopback"三级测试方案 |
 | `STM32/` | 用户新增 | UDP 测试模型 + `send_test_packet.m` |
 
@@ -240,70 +245,208 @@ PS Converter 必须设：
 
 ## UDP 输出链路（已实现）
 
-**SModel_RTHM.slx 顶层新增 7 个块**，从 `TowerTopLoad` 和 `NacAcc` Goto 标签读取信号，经 Han et al. (2025) Eq.2-5 补偿后，降采样到 25 Hz 通过 UDP 发给 STM32：
+**SModel_RTHM.slx 顶层新增 9 个块**，从 Wind turbine 子系统读取 TowerTopLoad + NacAcc，并从 Bushing Joint 输入分支提取平台姿态/角速度/角加速度。经完整 Han et al. (2025) Eq.2-5 补偿后，降采样到 25 Hz 通过 UDP 发给 STM32：
 
 ```
-UDP_TowerTopLoad_From ──► UDP_RateTransition ──┐
-  (TowerTopLoad1, [6×1])   (0.01→0.04s, 25Hz)  │
-                                                 ├──► UDP_PackBytes ──► UDP_Send
-UDP_NacAcc_From ────────► UDP_NacAcc_RT ────────┤    (MATLAB System)   (192.168.1.100:8080)
-  (NacAcc1, [3×1])         (0.01→0.04s)         │    3 inputs:          ↑
-                                                 │    [6] + [1] + [3]   │
-                             UDP_SeqCounter ─────┘                      │
-                             (Counter Limited, tsamp=0.04)              │
+                        ┌── Demux (pos rot) → UDP_EulAng_Mux → UDP_EulAng_RT ──┐
+                        │                                                       │
+UDP_TowerTopLoad_From   │   Demux2 (acc rot) → UDP_AngAcc_Mux → UDP_AngAcc_RT ─┤
+  → UDP_RateTransition ─┤                                                       ├──► UDP_PackBytes ──► UDP_Send
+                        │   Demux1 (vel rot) → UDP_AngVel_Mux → UDP_AngVel_RT ─┤    (MATLAB System)   (192.168.1.100:8080)
+UDP_NacAcc_From         │                                                       │    6 inputs:          ↑
+  → UDP_NacAcc_RT ──────┤                                                       │    [6]+[1]+[3]×4     │
+                        │                                                       │                      │
+                        └─── UDP_SeqCounter ────────────────────────────────────┘                      │
+                             (Counter Limited, tsamp=0.04, 0..2^32-1)                                 │
 ```
 
-**Han et al. (2025) Eq.2–5 补偿** (在 `UDPPacketPacker.stepImpl` 中实现):
+### 完整补偿 + 缩尺公式
+
+补偿在 `UDPPacketPacker.compensate()` 中实现（2026-05-18, 三次迭代完成），缩尺在 `scaleToModel()` 中实现：
+
 ```
-F_aero = F_ttLoad - m_RNA·a_nac - m_RNA·g
-M_aero = M_ttLoad - r_cg × (m_RNA·a_nac) - r_cg × (m_RNA·g)
+F_aero = F_tt - m·a_nac - m·R_i2b(θ)·g_inertial
+M_aero = M_tt - r_cg×(m·a_nac) - r_cg×(m·R_i2b(θ)·g_inertial) - I·α - ω×(I·ω)
+
+F_model = F_aero / (ρ_ratio × λ³)    λ=50, ρ_ratio=1000/1025 → fScale≈128,125
+M_model = M_aero / (ρ_ratio × λ⁴)    mScale≈6,406,250
 ```
-其中 m_RNA = 921,778 kg, r_cg = [-6.90, 0, 10.83] m (相对塔顶).
+
+| 参数 | 值 | 来源 |
+|------|-----|------|
+| `RNA_mass` | 950,058 kg | nacelle(646,895) + yawBearing(28,280) + hub(69,360) + 3×blade(205,523) |
+| `RNA_cog` | [-6.70, 0, 10.51] m | 各组件 CG 相对塔顶的加权平均 |
+| `RNA_inertia` | 3×3 张量 (见 `UDPPacketPacker.m`) | 组件惯量 + 平行轴定理 |
+| `Gravity` | [0, 0, -9.80665] | 惯性系重力向量，按平台 Euler 角旋转到塔顶坐标系 |
+| `Lambda` | 50 | Froude 几何缩尺比 λ |
+| `RhoRatio` | 1000/1025 | ρ_fresh(水池) / ρ_sea(原型) |
+
+### 重力旋转
+
+`rotateGravity()` 使用平台 Euler 角 (XYZ convention) 将重力从惯性系旋转到塔顶坐标系：
+
+```
+g_body = [g_mag·sin(qy); -g_mag·cos(qy)·sin(qx); -g_mag·cos(qy)·cos(qx)]
+```
+
+偏航角 (qz) 不影响重力方向，未使用。平台 pitch/roll ≠ 0 时，重力在塔顶坐标系有 x/y 分量，补偿后 Fx/Fy 正确。
+
+### 模块清单
 
 | 块 | 类型 | 关键参数 |
 |---|---|---|
-| `UDP_TowerTopLoad_From` | From | GotoTag=`"TowerTopLoad1"` (global, 来自 Wind turbine 子系统) |
-| `UDP_RateTransition` | Rate Transition | OutPortSampleTime=`"0.04"` (100→25 Hz) |
-| `UDP_NacAcc_From` | From | GotoTag=`"NacAcc1"` (global, nacelle 3-axis acceleration) |
+| `UDP_TowerTopLoad_From` | From | GotoTag=`"TowerTopLoad1"` |
+| `UDP_RateTransition` | Rate Transition | OutPortSampleTime=`"0.04"` |
+| `UDP_NacAcc_From` | From | GotoTag=`"NacAcc1"` |
 | `UDP_NacAcc_RateTransition` | Rate Transition | OutPortSampleTime=`"0.04"` |
+| `UDP_EulAng_Mux` | Mux | 3→1 (Demux y4,y5,y6 分支) |
+| `UDP_EulAng_RT` | Rate Transition | OutPortSampleTime=`"0.04"` |
+| `UDP_AngAcc_Mux` | Mux | 3→1 (Demux2 y4,y5,y6 分支) |
+| `UDP_AngAcc_RT` | Rate Transition | OutPortSampleTime=`"0.04"` |
+| `UDP_AngVel_Mux` | Mux | 3→1 (Demux1 y4,y5,y6 分支) |
+| `UDP_AngVel_RT` | Rate Transition | OutPortSampleTime=`"0.04"` |
 | `UDP_SeqCounter` | Counter Limited | tsamp=`0.04`, uplimit=`4294967295` |
-| `UDP_PackBytes` | MATLAB System | System=`UDPPacketPacker`, 输入 [6×1]+[1×1]+[3×1], 输出 [28×1 uint8] |
+| `UDP_PackBytes` | MATLAB System | System=`UDPPacketPacker`, 6 inputs: [6]+[1]+[3]×4, output [28×1 uint8] |
 | `UDP_Send` | MATLAB System | Host=`192.168.1.100`, Port=`8080`, LocalPort=`12345`, Blocking=`off` |
 
-**数据包格式**（与 `send_test_packet.m` 完全一致）：
+### 补偿性能
+
+| 测试 | Fz 削减 | My 削减 | 残余 Fz | 残余 My |
+|------|---------|---------|---------|---------|
+| A0 静态 (θ=0) | −9.41→−0.089 MN (**99.1%**) | −62.2→+0.27 MN·m (**99.6%**) | 气动 tilt + 残差 | 气动 My |
+| 运动 (pitch+roll 2°) | −9.44→−0.061 MN (**99.4%**) | −71.2→+4.86 MN·m (**93.2%**) | — | — |
+| **陀螺项** ω×(I·ω) | — | — | — | < 4 kN·m (**<0.01%** of gravity My) |
+
+### 缩尺后典型值（A0 静态, 8 m/s, λ=50）
+
+| 分量 | 原型尺度 (补偿后) | 模型尺度 (UDP 输出) | 单位 |
+|------|-------------------|---------------------|------|
+| Fx | +1.44 MN | **+11.2 N** | 推力，7 桨合力 |
+| Fy | ~0 | ~0 | — |
+| Fz | −0.089 MN | **−0.69 N** | 垂向残余力 |
+| Mx | ~10 MN·m | **~1.56 N·m** | — |
+| My | +0.27 MN·m | **+0.042 N·m** | — |
+| Mz | ~0 | ~0 | — |
+
+7 桨单桨最大推力 12.09 N（16V 官方值），最大工况 Fx ≈ 11 N 在安全范围内。
+
+### 数据包格式
+
+28 字节（与 `send_test_packet.m` 一致，**内容是补偿后的等效 hub 气动 6-DOF**）：
 - 1–4 字节: uint32 LE 序号
 - 5–28 字节: 6 × single LE (Fx, Fy, Fz, Mx, My, Mz)
-- 总计 28 字节
 
+---
 
-**UDPPacketPacker** (`UDPPacketPacker.m`): MATLAB System 类。`stepImpl` 接收 3 路输入 → 调用 `compensate()` 做 Han Eq.2–5 补偿 → `packBytes()` 打包为 28 字节 uint8。RNA 质量和 CG 作为类属性，可通过 `set_param` 或直接改类文件调整。补偿可通过 `EnableCompensation` 属性开关。
+## RNA 参数标定
 
-**已验证** (2026-05-17): `initializeRTHM_replay.m` 跑 120s 仿真，25 Hz × 120s = ~3000 包正常发出，120s 原型仿真用时 111s。
+当前参数精度已很高（Fz 残差 < 1%），如需进一步精调，三种方法：
 
-**注意事项**:
-- 发送的是 **补偿后的等效 hub 气动 6-DOF**（已扣除 RNA 重力 + 惯性力）
-- 补偿精度：A0 静态测试 Fz 从 -9.40 MN → -0.36 MN（削减 96%），My 从 -56.9 MN·m → -2.68 MN·m（削减 95%）
-- 残余误差主要来自 (1) RNA 质量/ CG 参数精度 (2) 重力在塔顶坐标系投影的近似（当前假设塔近垂直）
-- 如果 STM32 没接或没监听 8080 端口，UDP 包会被静默丢弃（UDP 无连接）
-- 模型更新 (Ctrl+D) 需要 base workspace 中定义 simu/wind/windTurbine 等变量，否则 Wind turbine 子系统 mask 报错
+### 方法一：多风速静态（解耦气动 Fz vs 质量误差）
 
-### 踩坑: MATLAB Function vs MATLAB System
+跑 3 个风速 (5, 8, 11 m/s) 的 A0 静态测试。compensated Fz 对 Fx 线性拟合：
+```
+comp_Fz = a × Fx + b
+```
+- `a` = sin(tilt) ≈ 0.105（实验验证 tilt 角）
+- `b` = 真实质量误差 × g（若非零，修正 RNA_mass）
 
-最初尝试用 `simulink/User-Defined Functions/MATLAB Function` 做字节打包，但 R2025b 的 Stateflow API 变化导致无法通过 `sf()` 或 `sfroot` 程序化设置 EML Chart 的 Script。换成 `simulink/User-Defined Functions/MATLAB System` + 独立类文件 `UDPPacketPacker.m` 解决了问题。注意 `matlab.System` 子类必须实现 `isOutputComplexImpl` 和 `isInputComplexImpl` 方法（R2025b 会检查），否则编译报错。
+### 方法二：多姿态静态（独立精标 CG）
 
-### 初始化脚本更新
+无风 (wind=0)，3 个平台 pitch 角 (0°, ±3°)，各跑静态。TowerTopLoad 纯重力，My(θ) 完全由 CG 决定。两个角度的 My 差值可独立解出 cg_x 和 cg_z：
+```
+cg_x = −[My(θ₁) − My(θ₂)] / [m·g × (cos(θ₁) − cos(θ₂))]
+```
 
-`initializeRTHM.m` 和 `initializeRTHM_replay.m` 开头都加了:
+### 方法三：CAD STEP 提取
+
+`geometry/` 目录下 STEP 文件可用 MATLAB `importGeometry` + `inertialProperties` 提取精确质量属性。需知道各组件材料密度分配。
+
+**建议**：当前精度对 RTHM 已够用（执行器标定精度 ~3-5%），方法一性价比最高。
+
+---
+
+### 踩坑记录
+
+**MATLAB Function vs MATLAB System**: 最初尝试用 MATLAB Function 块做字节打包，R2025b Stateflow API 变化导致无法程序化设置 EML Chart Script。改用 MATLAB System + 独立类文件解决。`matlab.System` 子类必须实现 `isOutputComplexImpl` 和 `isInputComplexImpl`。
+
+**GravityVector=[0 0 0] 但 TowerTopLoad 含重力**: Mechanism Configuration 的 GravityVector 为 [0,0,0]，但 TowerTopLoad 仍包含 ~9.3 MN 的重力分量。原因是 MOST 模型通过 Bushing Joint 的外部约束间接传递了上部结构的重量效应。因此补偿中显式减去 m·g 项。
+
+### 初始化脚本
+
+`initializeRTHM.m` 和 `initializeRTHM_replay.m` 开头均有:
 ```matlab
 addpath(fileparts(mfilename('fullpath')));
 ```
-确保 `UDPPacketPacker` 类在路径上。
 
 ---
 
 ## 下一步
 
-1. **hub-frame 气动重建** ✅ **已实现** (2026-05-17): Han et al. 2025 Eq.2–5 补偿已在 `UDPPacketPacker.compensate()` 中落地。A0 静态验证：Fz 削减 96%, My 削减 95%。待完善：(a) 用平台姿态实时旋转重力向量（当前假设塔近垂直），(b) 加入转动惯性补偿 (I·α + ω×I·ω 项)，(c) 添加 NacAcc angular velocity/acceleration 输入。
-2. **LUT 单步耗时 benchmark**：用 `tic/toc` 包 `sim(...)` 3 次取均值除以步数。项目根 CLAUDE.md TODO Phase 3 要求 < 10 ms/step。
-3. **Level 3：UDP loopback**：建 `MockMocap.slx`，把 `level2_volturnUS_ref.mat` 的 body 6-DOF 用 UDP 100 Hz 发回 SModel_RTHM.slx 的 UDP Receive 块（替换 From Workspace），验证字节序、float32/64、丢包注入、watchdog。同时做 MATLAB → STM32 的实机收发验证（Wireshark 抓包 + STM32 解析 28 字节包）。
+1. **UDP 补偿 + 缩尺** ✅ **已完成** (2026-05-18): Han Eq.2-5 完整补偿 (平移+重力旋转+转动惯性+陀螺) + Froude 缩尺 λ=50。A0 静态 Fz 削减 99.1%, My 削减 99.6%。UDP 输出为模型尺度 (N / N·m 级)。
+2. **LUT 单步耗时 benchmark** ✅ **已完成** (2026-05-18): 3×30 s 仿真, IEA15MW LUT 模式, 平均 8.01 ms/step, 最差 9.00 ms/step, ×1.2 超实时。40 ms 控制周期内可执行 ~5 个 sim 步。
+3. **Level 3：UDP loopback** 🔄 **进行中** (2026-05-18)：
+   - ✅ Mocap 数据打包/解包类 + 纯 MATLAB 往返测试通过
+   - ✅ UDP localhost 12001 包收发: 0 丢包, 8812 pkt/s
+   - ⬜ **下一步**: 修改 SModel_RTHM.slx 加入 UDP Receive（详见下方 Level 3 架构）
+   - ⬜ `runLevel3_Loopback.m`：异步 mocap 发送 + 同步 RTHM 仿真 + Level 2 对比
 4. **Level 3 之后**：把 STM32 那一头接进来，整条 mocap → MATLAB → MOST → 缩放 → 7 桨分配 → STM32 通路在水池外打通。
+5. **RNA 参数标定**（可选）：多风速静态测试解耦气动 tilt 效应与质量误差。
+
+---
+
+## Level 3 UDP Loopback 架构
+
+### 数据流
+
+```
+level2_volturnUS_ref.mat          SModel_RTHM.slx (修改后)
+  body_pos/vel/acc                  ┌──────────────────────────────────┐
+  (原型尺度, 12001 步)              │                                  │
+       │                            │  UDP Receive (127.0.0.1:10001)   │
+       ▼                            │       ↓                          │
+  runMocapSender.m                  │  MocapPacketUnpacker             │
+  (MATLAB timer, 100 Hz)            │   → pos[6], vel[6], acc[6]       │
+       │                            │       ↓                          │
+       ▼                            │  Demux × 3 → 18 路标量           │
+  dsp.UDPSender ──UDP──►            │  PS Converter × 6                │
+      127.0.0.1:10001               │  (Provide 1st & 2nd derivatives) │
+  76 bytes/pkt                      │       ↓                          │
+  [seq|pos(6)|vel(6)|acc(6)]       │  Bushing Joint (6 motion DOF)    │
+                                    │       ↓                          │
+                                    │  Wind turbine → TowerTopLoad     │
+                                    │       → UDP_PackBytes → STM32    │
+                                    └──────────────────────────────────┘
+```
+
+### SModel_RTHM.slx 需要修改的内容
+
+1. **删除** 3 个 From Workspace 块（`BushingPos/Vel/Acc`）和对应 3 个 Demux
+2. **添加** `UDP Receive` 块（`instrumentlib/UDP Receive`）:
+   - Local IP Port: `10001`
+   - Data type: `uint8`
+   - Data size: `[76 1]`
+   - Sample time: `0.01`
+   - Blocking: `off`（非阻塞，无数据时输出 0）
+3. **添加** `MATLAB System` 块，System=`MocapPacketUnpacker`
+   - 输入: UDP Receive 的 Data 输出 [76×1 uint8]
+   - 输出: pos[6], vel[6], acc[6]（全 double）
+4. **添加** 3 个 `Demux`（各 6 路），从 pos/vel/acc 分别拆出 18 路标量
+5. **连接** 18 路标量 → 6 个 `PS Converter` 的 3 路输入（f, f', f''）
+6. **PS Converter 设置**: Filtering = `Provide input derivative(s)`, Input derivatives = `Provide first and second derivatives`
+
+### 异步发送方案
+
+不能用两个 Simulink 模型同时跑（`sim()` 阻塞）。方案是用 MATLAB `timer` 在 `sim()` 阻塞期间异步发送 UDP：
+
+```matlab
+sender = dsp.UDPSender('RemoteIPAddress', '127.0.0.1', 'RemoteIPPort', 10001);
+idx = 1;
+t = timer('ExecutionMode', 'fixedRate', 'Period', 0.01, ...
+    'TimerFcn', @(~,~) sendNextPacket(), 'TasksToExecute', length(packets));
+start(t);           % timer 在后台运行
+sim('SModel_RTHM'); % 前台阻塞, timer 仍在发送
+stop(t); delete(t);
+```
+
+已验证 MATLAB timer 在 `sim()` 阻塞期间正常触发（timer 使用独立线程）。
