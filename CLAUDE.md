@@ -24,8 +24,12 @@ Level 1 假信号物理判据由于 LUT 模式 + 常风下 V_at_hub 与平台运
 | `benchLUT.m` | **已运行** | LUT 单步耗时 benchmark：3×30s, 平均 8.01 ms/step, ×1.2 超实时 |
 | `MocapPacketPacker.m` | **已验证** | MATLAB System 类：4 路输入 [pos(6),vel(6),acc(6),seq] → 76 字节 UDP 包 |
 | `MocapPacketUnpacker.m` | **已验证** | MATLAB System 类：76 字节 UDP 包 → [pos(6),vel(6),acc(6),seq,valid] 5 路输出 |
+| `MocapUdpSender.m` | **已验证** | 封装 dsp.UDPSender + timer 的异步发送类（timer 方案受 sim() 阻塞限制） |
 | `testMocapPackUnpack.m` | **已通过** | 纯 MATLAB 打包/解包往返测试，误差 < 1e-6 |
 | `testUdpMocapLoopback.m` | **已通过** | 纯 MATLAB UDP localhost 收发测试: 12001 包, 0 丢包, 8812 pkt/s |
+| `modifyModelForLevel3.m` | **已执行** | 程序化修改 SModel_RTHM.slx：From Workspace → UDP Receive + Unpacker |
+| `runLevel3_Loopback.m` | **已尝试** | Level 3 完整 loopback 脚本（受限于 sim() 阻塞，timer 发包不可靠） |
+| `runLevel3_QuickTest.m` | **已尝试** | 异步启动 + 轮询发包方案（get_param 开销过大，不可行） |
 | `MOST开发.md` | 用户笔记 | 记录"假信号 → 全数值回放 → UDP loopback"三级测试方案 |
 | `STM32/` | 用户新增 | UDP 测试模型 + `send_test_packet.m` |
 
@@ -385,12 +389,14 @@ addpath(fileparts(mfilename('fullpath')));
 
 1. **UDP 补偿 + 缩尺** ✅ **已完成** (2026-05-18): Han Eq.2-5 完整补偿 (平移+重力旋转+转动惯性+陀螺) + Froude 缩尺 λ=50。A0 静态 Fz 削减 99.1%, My 削减 99.6%。UDP 输出为模型尺度 (N / N·m 级)。
 2. **LUT 单步耗时 benchmark** ✅ **已完成** (2026-05-18): 3×30 s 仿真, IEA15MW LUT 模式, 平均 8.01 ms/step, 最差 9.00 ms/step, ×1.2 超实时。40 ms 控制周期内可执行 ~5 个 sim 步。
-3. **Level 3：UDP loopback** 🔄 **进行中** (2026-05-18)：
-   - ✅ Mocap 数据打包/解包类 + 纯 MATLAB 往返测试通过
-   - ✅ UDP localhost 12001 包收发: 0 丢包, 8812 pkt/s
-   - ⬜ **下一步**: 修改 SModel_RTHM.slx 加入 UDP Receive（详见下方 Level 3 架构）
-   - ⬜ `runLevel3_Loopback.m`：异步 mocap 发送 + 同步 RTHM 仿真 + Level 2 对比
-4. **Level 3 之后**：把 STM32 那一头接进来，整条 mocap → MATLAB → MOST → 缩放 → 7 桨分配 → STM32 通路在水池外打通。
+3. **Level 3：UDP loopback** ✅ **完结** (2026-05-18)：
+   - ✅ Mocap 数据打包/解包类 (`MocapPacketPacker`, `MocapPacketUnpacker`)
+   - ✅ 纯 MATLAB 打包/解包往返测试通过（误差 < 1e-6）
+   - ✅ UDP localhost 12001 包收发测试: 0 丢包, 8812 pkt/s（字节级验证通过）
+   - ✅ SModel_RTHM.slx 已修改: From Workspace → UDP Receive + MocapPacketUnpacker（`modifyModelForLevel3.m`）
+   - ❌ `sim()` 阻塞期间进程内 UDP 发送不可行——timer/轮询/异步启动均受 MATLAB 主线程架构限制
+   - **结论**: 字节级和 pack/unpack 逻辑已验证通过，Simulink 模型侧已就绪。完整收发对比需双 MATLAB 实例或真实 mocap 硬件
+4. **Level 3 之后 → B1 STM32 通信验证**：在 `D:\STM32CubeIDE_workspace_1.17.0\RTOS_MultiRotor\` 进行——Wireshark 抓包验证 MATLAB→STM32 28 字节包，ping 通，延迟测试
 5. **RNA 参数标定**（可选）：多风速静态测试解耦气动 tilt 效应与质量误差。
 
 ---
@@ -435,18 +441,16 @@ level2_volturnUS_ref.mat          SModel_RTHM.slx (修改后)
 5. **连接** 18 路标量 → 6 个 `PS Converter` 的 3 路输入（f, f', f''）
 6. **PS Converter 设置**: Filtering = `Provide input derivative(s)`, Input derivatives = `Provide first and second derivatives`
 
-### 异步发送方案
+### 异步发送方案（尝试过，不可靠）
 
-不能用两个 Simulink 模型同时跑（`sim()` 阻塞）。方案是用 MATLAB `timer` 在 `sim()` 阻塞期间异步发送 UDP：
+尝试了 3 种方案在 `sim()` 阻塞期间发送 UDP：
 
-```matlab
-sender = dsp.UDPSender('RemoteIPAddress', '127.0.0.1', 'RemoteIPPort', 10001);
-idx = 1;
-t = timer('ExecutionMode', 'fixedRate', 'Period', 0.01, ...
-    'TimerFcn', @(~,~) sendNextPacket(), 'TasksToExecute', length(packets));
-start(t);           % timer 在后台运行
-sim('SModel_RTHM'); % 前台阻塞, timer 仍在发送
-stop(t); delete(t);
-```
+| 方案 | 结果 | 原因 |
+|------|------|------|
+| MATLAB timer @ 100 Hz | 丢包 >30% | timer 回调在 sim 期间触发频率远低于设定值 |
+| timer @ 120 Hz + queue | 丢包 >50% | BusyMode='queue' 导致级联积压 |
+| `set_param('start')` 异步 + 主线程轮询 | 1 pkt/s | `get_param('SimulationStatus')` 每次 ~1s |
 
-已验证 MATLAB timer 在 `sim()` 阻塞期间正常触发（timer 使用独立线程）。
+**根因**: `sim()` 阻塞 MATLAB 主线程时，timer 和 drawnow 事件处理严重受限。
+
+**正确做法**: 用两个独立进程——MATLAB 实例 1 发包、实例 2 跑 `sim()`，或等真实 mocap 硬件到场后直接用硬件发包。纯 MATLAB UDP 字节级往返测试已通过，逻辑正确性已验证。Simulink 模型侧的 UDP Receive 修改已完成，就等数据源。
